@@ -26,6 +26,7 @@ default_args = {
 
 dag = DAG('fron-gpc-datacleaning', schedule_interval='@daily', default_args=default_args)
 
+in_bucket = "landingarea"
 
 ############################################################################
 # utility functions
@@ -65,11 +66,15 @@ def uploadGcSBlob(bucket, source_file_name, destination_blob_name):
     print("file %s uploaded to %s" %(source_file_name, destination_blob_name))
     return True
 
-def get_curent_file_path(ds, prefix=""):
+def get_curent_file_path(ds, prefix="", suffix=""):
     tmp = ds.replace("-", "_")
     if len(prefix) != '' and prefix[-1] != '/':
         prefix += '/'
-    filepath = '%s%s/%s.csv' % (prefix, tmp[0:7], tmp)
+    filepath = '%s%s/%s' % (prefix, tmp[0:7], tmp)
+
+    if len(suffix) > 0:
+        filepath += ".csv"
+
     return filepath
 
 
@@ -94,7 +99,6 @@ def get_in_out_paths(date, prev_stage, cur_stage):
 #ef ensure_folder_exits(folder):
 #   from google.cloud import storage
 #   storage_client = storage.Client()
-#   in_bucket = "landingarea"
 #   bucket = storage_client.get_bucket(in_bucket)
 #
 #   logging.info("trying to get %s", inpath)
@@ -114,12 +118,11 @@ def get_in_out_paths(date, prev_stage, cur_stage):
 
 
 def input_is_present(ds, **context):
-    in_bucket = "landingarea"
 
     path = "datalanding/fronius"
 
     logging.info("processing bucket: %s, path %s", in_bucket, path)
-    blob_path = get_curent_file_path(ds, path)
+    blob_path = get_curent_file_path(ds, path, suffix="csv")
 
     from google.cloud import storage
     storage_client = storage.Client()
@@ -142,10 +145,11 @@ def add_timestamps(ds, **context):
     import pandas as pd
 
     inpath, outpath = get_in_out_paths(ds, prev_stage='datalanding', cur_stage='w_timestamps')
+    inpath += ".csv"
+    outpath += ".msgpack"
 
     from google.cloud import storage
     storage_client = storage.Client()
-    in_bucket = "landingarea"
     bucket = storage_client.get_bucket(in_bucket)
 
     logging.info("trying to get %s", inpath)
@@ -186,20 +190,26 @@ def add_timestamps(ds, **context):
 
     logging.info("start uploading")
 
-    # todo: pani proper filehandling
-    uploadGcSBlob(in_bucket, out_filename, outpath[:-3] + 'msgpack')
+    uploadGcSBlob(in_bucket, out_filename, outpath)
     return True
-
 
 def remove_duplicates(ds, **context):
     import pandas as pd
     import numpy as np
-    import os.path
     import os
 
-    inpath, outpath = get_in_out_paths(ds, 'timestamps', cur_stage='duplicates_removed')
-    print('reading file from: %s' % (inpath + '.msgpack'))
-    d = pd.read_msgpack(inpath + '.msgpack')
+    infile, outfile = get_in_out_paths(ds, 'w_timestamps', cur_stage='duplicates_removed')
+    infile += ".msgpack"
+    outfile += ".msgpack"
+    print('reading file from: %s' % (infile + '.msgpack'))
+
+    from tempfile import mkstemp
+    fd, filename =  mkstemp(suffix="msgpack")
+    if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
+        raise AirflowException("error while downloading blob")
+
+
+    d = pd.read_msgpack(filename)
 
     def get_duplicates(data):
         assert (data["Timestamp"].is_monotonic)
@@ -222,8 +232,16 @@ def remove_duplicates(ds, **context):
     data_out= data_out.reset_index()
     no_dups = data_out.drop_duplicates()
 
-    os.makedirs(os.path.dirname(outpath), exist_ok=True )
-    no_dups.to_msgpack(outpath + '.msgpack')
+
+
+    import os
+    fd, out_filename =  mkstemp(suffix=".msgpack")
+    no_dups.to_msgpack(out_filename)
+
+    print(os.listdir())
+
+    logging.info("start uploading")
+    uploadGcSBlob(in_bucket, out_filename, outfile)
 
     return True
 
@@ -250,4 +268,14 @@ task_add_timestamps = PythonOperator(
     #outlets={"datasets" :[outfile]},
     dag=dag)
 
-task_input_check >> task_add_timestamps
+
+task_remove_duplicates = PythonOperator(
+    task_id='remove_duplicates',
+    provide_context=True,
+    python_callable=remove_duplicates,
+    depends_on_past = True,
+    #inlets={"datasets" :[infile]},
+    #outlets={"datasets" :[outfile]},
+    dag=dag)
+
+task_input_check >> task_add_timestamps >> task_remove_duplicates
