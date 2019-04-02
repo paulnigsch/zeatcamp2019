@@ -15,7 +15,7 @@ import logging
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2018, 1, 27),
+    'start_date': datetime(2018, 1, 29),
     'email': ['airflow@example.com'],
     'email_on_failure': False,
     'email_on_retry': False,
@@ -246,6 +246,65 @@ def remove_duplicates(ds, **context):
     return True
 
 
+def reindex_data(ds, **kwargs):
+    import pandas as pd
+    import numpy as np
+    import os.path
+    import os
+
+    infile, outfile = get_in_out_paths(ds, prev_stage='duplicates_removed', cur_stage='reindex')
+    print('reading file from: %s' % (infile + '.msgpack'))
+
+    infile += ".msgpack"
+    outfile += ".msgpack"
+    print('reading file from: %s' % (infile + '.msgpack'))
+
+    from tempfile import mkstemp
+    fd, filename =  mkstemp(suffix="msgpack")
+    if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
+        raise AirflowException("error while downloading blob")
+
+    data = pd.read_msgpack(filename)
+
+    ##############################################
+    # logic
+
+    ip_index = ['192.168.0.101', '192.168.0.103', '192.168.0.105']
+    good_sensor_vals = data[ data['IP'].apply( lambda x : x in ip_index)]
+
+    ds_split = [int(i) for i in ds.split('-')]
+    from datetime import datetime
+
+    start_date = datetime(*ds_split, 0,0,0)
+    end_date = datetime(*ds_split, 23, 59, 59)
+
+    #dt_index = range(int(np.round(good_sensor_vals["Timestamp"].min())), int(np.round(good_sensor_vals["DT"].max())) + 1)
+    dt_index = range(int(start_date.timestamp()), int(end_date.timestamp()) + 1)
+    ar = list(map(lambda x: [(x, i) for i in ip_index], dt_index))
+
+    new_index = [item for sublist in ar for item in sublist]
+    d_indexed = good_sensor_vals.set_index(['Timestamp', "IP"])
+
+    d_reindexed = d_indexed.reindex(new_index)
+    data_out = d_reindexed.reset_index()
+
+    ##############################################
+    # storing
+
+    import os
+    fd, out_filename =  mkstemp(suffix=".msgpack")
+    data_out.to_msgpack(out_filename)
+
+    print(os.listdir())
+
+    logging.info("start uploading")
+    uploadGcSBlob(in_bucket, out_filename, outfile)
+
+    return True
+
+
+
+
 ############################################################################
 # dag construction
 ############################################################################
@@ -254,7 +313,7 @@ task_input_check = PythonOperator(
     task_id='check_input_availability',
     provide_context=True,
     python_callable=input_is_present,
-    depends_on_past = True,
+    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
@@ -263,7 +322,7 @@ task_add_timestamps = PythonOperator(
     task_id='add_timestamps',
     provide_context=True,
     python_callable=add_timestamps,
-    depends_on_past = True,
+    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
@@ -273,9 +332,19 @@ task_remove_duplicates = PythonOperator(
     task_id='remove_duplicates',
     provide_context=True,
     python_callable=remove_duplicates,
-    depends_on_past = True,
+    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
 
-task_input_check >> task_add_timestamps >> task_remove_duplicates
+task_reindex_data = PythonOperator(
+    task_id='reindex_data',
+    provide_context=True,
+    python_callable=reindex_data,
+    #depends_on_past = True,
+    #inlets={"datasets" :[infile]},
+    #outlets={"datasets" :[outfile]},
+    dag=dag)
+
+task_input_check >> task_add_timestamps >> task_remove_duplicates >> task_reindex_data
+
