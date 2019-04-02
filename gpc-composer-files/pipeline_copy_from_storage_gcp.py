@@ -100,21 +100,37 @@ task_list_local_file = PythonOperator(
     start_date= datetime(2018, 1, 29),
     )
 
+def downloadGcSBlob(bucket, name, dest, remove_old=True):
+    from google.cloud import storage
+    import os
+    storage_client = storage.Client()
+   
+    bucket = storage_client.get_bucket(bucket)
+    blob = bucket.blob(name)
+
+    if remove_old and os.path.isfile(dest):
+        os.remove(dest)
+
+    blob.download_to_filename(dest)
+
+    print("downloaded %s/%s to %s" %(bucket, blob, dest))
+
+
+
 def use_python_sdk(ds, **context):
     print("==============================================")
     # Imports the Google Cloud client library
-    from google.cloud import storage
-    storage_client = storage.Client()
 
-   
-    bucket = storage_client.get_bucket("landingarea")
-    blob = bucket.blob('datalanding/fronius/2018_01/2018_01_29.csv')
+    blob_base_name = ds.replace("-", "_")
+    bucket = "landingarea"
+    blob_base_path = "datalanding/fronius"
+    destination = blob_base_name + ".csv" 
 
-    blob.download_to_filename("test.csv")
 
-    print('Blob {} downloaded to {}.'.format(
-        'datalanding/fronius/2018_01/2018_01_29.csv',
-        "test.csv"))
+    blob_full_path = blob_base_path + "/" + blob_base_name[0:7] + "/" + blob_base_name + ".csv"
+
+    downloadGcSBlob(bucket, blob_full_path, destination)
+
     print("==============================================")
     import os
     pprint(os.listdir())
