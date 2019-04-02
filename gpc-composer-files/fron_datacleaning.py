@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from airflow.contrib.operators.gcs_list_operator import GoogleCloudStorageListOperator
 import os
 import logging
+from tempfile import mkstemp
 
 
 
@@ -38,7 +39,6 @@ def removeFile(path):
 
 def downloadGcSBlob(bucket, name, dest, remove_old=True):
     from google.cloud import storage
-    import os
     storage_client = storage.Client()
 
     bucket = storage_client.get_bucket(bucket)
@@ -55,7 +55,6 @@ def downloadGcSBlob(bucket, name, dest, remove_old=True):
 def uploadGcSBlob(bucket, source_file_name, destination_blob_name):
 
     from google.cloud import storage
-    import os
     storage_client = storage.Client()
 
     bucket = storage_client.get_bucket(bucket)
@@ -164,8 +163,7 @@ def add_timestamps(ds, **context):
     ## copy data
 
 
-    from tempfile import mkstemp
-    fd, filename =  mkstemp()
+    fd, filename = mkstemp()
     if not downloadGcSBlob(in_bucket, inpath, filename, remove_old=True):
         raise AirflowException("error while downloading blob")
 
@@ -182,8 +180,9 @@ def add_timestamps(ds, **context):
 
     data["Temperature"][invalid_temperature] = None
 
-    import os
-    fd, out_filename =  mkstemp(suffix=".msgpack")
+    ##############################################
+    # storing
+    fd, out_filename = mkstemp(suffix=".msgpack")
     data.to_msgpack(out_filename)
 
     print(os.listdir())
@@ -191,20 +190,20 @@ def add_timestamps(ds, **context):
     logging.info("start uploading")
 
     uploadGcSBlob(in_bucket, out_filename, outpath)
+    removeFile(filename)
+    removeFile(out_filename)
     return True
 
 def remove_duplicates(ds, **context):
     import pandas as pd
     import numpy as np
-    import os
 
     infile, outfile = get_in_out_paths(ds, 'w_timestamps', cur_stage='duplicates_removed')
     infile += ".msgpack"
     outfile += ".msgpack"
     print('reading file from: %s' % (infile + '.msgpack'))
 
-    from tempfile import mkstemp
-    fd, filename =  mkstemp(suffix="msgpack")
+    fd, filename = mkstemp(suffix="msgpack")
     if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
         raise AirflowException("error while downloading blob")
 
@@ -234,8 +233,7 @@ def remove_duplicates(ds, **context):
 
 
 
-    import os
-    fd, out_filename =  mkstemp(suffix=".msgpack")
+    fd, out_filename = mkstemp(suffix=".msgpack")
     no_dups.to_msgpack(out_filename)
 
     print(os.listdir())
@@ -243,14 +241,14 @@ def remove_duplicates(ds, **context):
     logging.info("start uploading")
     uploadGcSBlob(in_bucket, out_filename, outfile)
 
+    removeFile(filename)
+    removeFile(out_filename)
+
     return True
 
 
 def reindex_data(ds, **kwargs):
     import pandas as pd
-    import numpy as np
-    import os.path
-    import os
 
     infile, outfile = get_in_out_paths(ds, prev_stage='duplicates_removed', cur_stage='reindex')
     print('reading file from: %s' % (infile + '.msgpack'))
@@ -259,8 +257,7 @@ def reindex_data(ds, **kwargs):
     outfile += ".msgpack"
     print('reading file from: %s' % (infile + '.msgpack'))
 
-    from tempfile import mkstemp
-    fd, filename =  mkstemp(suffix="msgpack")
+    fd, filename = mkstemp(suffix="msgpack")
     if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
         raise AirflowException("error while downloading blob")
 
@@ -291,14 +288,18 @@ def reindex_data(ds, **kwargs):
     ##############################################
     # storing
 
-    import os
-    fd, out_filename =  mkstemp(suffix=".msgpack")
+    fd, out_filename = mkstemp(suffix=".msgpack")
     data_out.to_msgpack(out_filename)
 
     print(os.listdir())
 
     logging.info("start uploading")
     uploadGcSBlob(in_bucket, out_filename, outfile)
+
+    ##############################################
+    # cleanup
+    removeFile(filename)
+    removeFile(out_filename)
 
     return True
 
@@ -313,8 +314,7 @@ def merge_data(ds, **kwargs):
     outfile += ".msgpack"
     print('reading file from: %s' % (infile + '.msgpack'))
 
-    from tempfile import mkstemp
-    fd, filename =  mkstemp(suffix="msgpack")
+    fd, filename = mkstemp(suffix="msgpack")
     if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
         raise AirflowException("error while downloading blob")
 
@@ -334,8 +334,7 @@ def merge_data(ds, **kwargs):
         data_prev = data.head(0)
     else:
 
-        from tempfile import mkstemp
-        fd, dataprev_name =  mkstemp(suffix=".msgpack")
+        fd, dataprev_name = mkstemp(suffix=".msgpack")
         if not downloadGcSBlob(in_bucket, prev_outpath, dataprev_name, remove_old=True):
             raise AirflowException("error while downloading blob")
 
@@ -346,19 +345,22 @@ def merge_data(ds, **kwargs):
     print("merging data from %s and %s" %( ds, prev_date) )
     data_out = pd.concat([data_prev, data])
 
-
     ##############################################
-    # storing ##############################################
     # storing
-
-    import os
-    fd, out_filename =  mkstemp(suffix=".msgpack")
+    fd, out_filename = mkstemp(suffix=".msgpack")
     data_out.to_msgpack(out_filename)
 
     print(os.listdir())
 
     logging.info("start uploading")
     uploadGcSBlob(in_bucket, out_filename, outfile)
+
+
+    ##############################################
+    # cleanup
+    removeFile(filename)
+    removeFile(dataprev_name)
+    removeFile(dataprev_name)
 
     return True
 
@@ -371,7 +373,6 @@ task_input_check = PythonOperator(
     task_id='check_input_availability',
     provide_context=True,
     python_callable=input_is_present,
-    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
@@ -380,7 +381,6 @@ task_add_timestamps = PythonOperator(
     task_id='add_timestamps',
     provide_context=True,
     python_callable=add_timestamps,
-    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
@@ -390,7 +390,6 @@ task_remove_duplicates = PythonOperator(
     task_id='remove_duplicates',
     provide_context=True,
     python_callable=remove_duplicates,
-    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
@@ -399,7 +398,6 @@ task_reindex_data = PythonOperator(
     task_id='reindex_data',
     provide_context=True,
     python_callable=reindex_data,
-    #depends_on_past = True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
