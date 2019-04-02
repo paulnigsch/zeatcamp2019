@@ -303,6 +303,64 @@ def reindex_data(ds, **kwargs):
     return True
 
 
+def merge_data(ds, **kwargs):
+    import pandas as pd
+
+    infile, outfile = get_in_out_paths(ds, prev_stage='reindex', cur_stage='merge')
+    print('reading file from: %s' % (infile + '.msgpack'))
+
+    infile += ".msgpack"
+    outfile += ".msgpack"
+    print('reading file from: %s' % (infile + '.msgpack'))
+
+    from tempfile import mkstemp
+    fd, filename =  mkstemp(suffix="msgpack")
+    if not downloadGcSBlob(in_bucket, infile, filename, remove_old=True):
+        raise AirflowException("error while downloading blob")
+
+    data = pd.read_msgpack(filename)
+
+    ##############################################
+    # logic
+    prev_date = kwargs['prev_execution_date']
+
+    if type(prev_date) != str:
+        prev_date = prev_date.strftime( "%Y_%m_%d")
+
+    prev_inpath, prev_outpath = get_in_out_paths(prev_date, prev_stage='reindex', cur_stage='merge')
+    prev_outpath += ".msgpack"
+
+    if prev_date == "2018_01_28":
+        data_prev = data.head(0)
+    else:
+
+        from tempfile import mkstemp
+        fd, dataprev_name =  mkstemp(suffix=".msgpack")
+        if not downloadGcSBlob(in_bucket, prev_outpath, dataprev_name, remove_old=True):
+            raise AirflowException("error while downloading blob")
+
+        data_prev = pd.read_msgpack(dataprev_name)
+
+
+
+    print("merging data from %s and %s" %( ds, prev_date) )
+    data_out = pd.concat([data_prev, data])
+
+
+    ##############################################
+    # storing ##############################################
+    # storing
+
+    import os
+    fd, out_filename =  mkstemp(suffix=".msgpack")
+    data_out.to_msgpack(out_filename)
+
+    print(os.listdir())
+
+    logging.info("start uploading")
+    uploadGcSBlob(in_bucket, out_filename, outfile)
+
+    return True
 
 
 ############################################################################
@@ -346,5 +404,17 @@ task_reindex_data = PythonOperator(
     #outlets={"datasets" :[outfile]},
     dag=dag)
 
-task_input_check >> task_add_timestamps >> task_remove_duplicates >> task_reindex_data
+
+task_merge_data = PythonOperator(
+    task_id='merge_data',
+    provide_context=True,
+    python_callable=merge_data,
+    #depends_on_past = True,
+    #inlets={"datasets" :[infile]},
+    #outlets={"datasets" :[outfile]},
+    dag=dag)
+
+task_input_check >> task_add_timestamps >> task_remove_duplicates >> task_reindex_data >> task_merge_data
+
+
 
