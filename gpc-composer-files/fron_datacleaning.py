@@ -21,7 +21,7 @@ default_args = {
     'email_on_retry': False,
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
-    'end_date': datetime(2018, 2, 1),
+    'end_date': datetime(2018, 3, 24),
 }
 
 dag = DAG('fron-gpc-datacleaning', schedule_interval='@daily', default_args=default_args)
@@ -409,7 +409,7 @@ task_merge_data = PythonOperator(
     task_id='merge_data',
     provide_context=True,
     python_callable=merge_data,
-    #depends_on_past = True,
+    depends_on_past=True,
     #inlets={"datasets" :[infile]},
     #outlets={"datasets" :[outfile]},
     dag=dag)
