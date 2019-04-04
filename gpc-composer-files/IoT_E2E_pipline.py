@@ -14,11 +14,15 @@ from pprint import pprint
 import pandas as pd
 from airflow.contrib.hooks.wasb_hook import WasbHook
 from airflow.hooks.base_hook import BaseHook
+from airflow.contrib.operators.gcs_to_bq import GoogleCloudStorageToBigQueryOperator
+from tempfile import NamedTemporaryFile
 
+import json
 from azure.storage import *
 
 from airflow.contrib.hooks.wasb_hook import WasbHook
 from azure.storage.blob import BlockBlobService
+#from airflow.contrib.operators.gcp_sql_operator import CloudSqlInstanceImportOperator
 
 default_args = {
     'owner': 'airflow',
@@ -32,7 +36,7 @@ default_args = {
     'end_date': datetime(2019, 4, 6),
 }
 
-dag = DAG('IoT-E2E-Pipeline', schedule_interval='@daily', default_args=default_args)
+dag = DAG('new-IoT-e2e-pipeline', schedule_interval='@daily', default_args=default_args)
 
 working_bucket = "iot-e2e-bucket"
 
@@ -116,7 +120,17 @@ def process_iot_hub_message_file(filename):
     return df_messages
 
 
+def flattenjson( b, delim ):
+    val = {}
+    for i in b.keys():
+        if isinstance( b[i], dict ):
+            get = flattenjson( b[i], delim )
+            for j in get.keys():
+                val[ i + delim + j ] = get[j]
+        else:
+            val[i] = b[i]
 
+    return val
 
 
 ############################################################################
@@ -176,7 +190,6 @@ def copy_files_from_azure_to_google(ds, **context):
 
     blobs_filtered = [ b for b in blobs if  file_name_regex.match(b.name)]
 
-    from tempfile import NamedTemporaryFile
     from avro.io import DatumReader, DatumWriter
     from avro.datafile import DataFileReader
     import json
@@ -200,8 +213,20 @@ def copy_files_from_azure_to_google(ds, **context):
 
             avro_reader = DataFileReader(f, DatumReader())
             for d in avro_reader:
-                d["Body"] =  str(d["Body"])
-                data.append(d)
+                message_body = d["Body"]
+                if len(message_body) > 0:
+                    try:
+                        d["Body"] = json.loads(message_body)
+                    except Exception as e:
+                        logging.error("Error: while parsing json")
+                        print(type(message_body))
+                        pprint(message_body)
+
+                        from sys import exit
+                        exit(-1)
+
+
+                    data.append(d)
 
 
     with NamedTemporaryFile(mode='a+', delete=True) as f:
@@ -232,11 +257,112 @@ def stored_paresed_data_in_azure (ds, **context):
 
     removeFile(filename)
 
+def store_every_msg_in_azure(ds, **context):
 
+    fd, filename = mkstemp(suffix=".json")
+    print("trying to download ")
+    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+
+    azure_conn_id = "custom_azure_credentials"
+    connection = BaseHook.get_connection(azure_conn_id)
+
+    import json
+    with open(filename, 'r') as f:
+        content = json.load(f)
+        block_blob_service = BlockBlobService(account_name=connection.login, account_key=connection.password)
+        count = 0
+        for mesg in content:
+            with NamedTemporaryFile(mode='a+b', delete=True) as outfile:
+                try:
+                    outfile.write( json.dumps(mesg).encode())
+                except Exception as e :
+                    logging.error(str(e))
+                    print(type(mesg))
+                    pprint(mesg)
+                    from sys import exit
+                    exit(-1)
+
+                outfile.seek(0)
+                block_blob_service.create_blob_from_stream(
+                    container_name="e2emessgageconverted",
+                    blob_name="single_files/%s/%i.json" %(ds, count),
+                    stream=outfile)
+                count += 1
+
+    removeFile(filename)
+
+
+
+def create_big_query_input(ds, **context):
+
+    print("\nstart create_big_query_input")
+    #downloadGcSBlob(working_bucket, name, dest)
+
+    fd, filename = mkstemp(suffix=".json")
+    logging.info("start downloading")
+    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+
+    outputfile, outputfile_name = mkstemp(suffix=".json")
+    with open(filename, 'r') as inputfile:
+        with open( outputfile_name, "a+") as outputfile:
+            logging.info("parsing json file")
+            content = json.load(inputfile)
+            logging.info("start processing messages")
+            for msg in content:
+                del msg["Properties"]
+                #outputfile.write(json.dumps(msg["Body"]))
+                outputfile.write(json.dumps(msg))
+                outputfile.write('\n')
+
+            logging.info("start uploading")
+            uploadGcSBlob(working_bucket, outputfile_name, 'bigtable/%s/%s.json' % (ds, ds))
+
+
+    removeFile(filename)
+    removeFile(outputfile_name)
+
+
+
+def flatten_files(ds, **context):
+
+    fd, filename = mkstemp(suffix=".json")
+    logging.info("start downloading")
+    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+
+    with open(filename, 'r') as f:
+        messages = json.load(f)
+
+    columns = ['EnqueuedTimeUtc', 'SystemProperties.messageId', 'SystemProperties.correlationId', 'SystemProperties.connectionDeviceId', 'SystemProperties.connectionAuthMethod', 'SystemProperties.connectionDeviceGenerationId', 'SystemProperties.contentType', 'SystemProperties.enqueuedTime', 'Body.deviceId', 'Body.messageId', 'Body.temperature', 'Body.humidity']
+
+
+    messages_flat = [ flattenjson(m,'.') for m in messages  ]
+    df = pd.DataFrame(messages_flat)
+
+    fd, outfile = mkstemp(suffix=".csv")
+    df.to_csv(outfile)
+
+
+    uploadGcSBlob(working_bucket, outfile, 'csv/%s/%s.json' % (ds, ds) )
+
+    logging.info("write to mysql")
+    from sqlalchemy import create_engine
+
+    host="XXXXXXXXXXXX"
+    database="powerbi_stuff"
+    user="powerbi"
+    password="XXXXXXXXXXXXXXXX"
+
+    engine=create_engine("mysql://%s:%s@%s/%s" % (user, password, host, database) )
+    df.head(100).to_sql(ds.replace('-',"_"), engine, if_exists='replace', chunksize=100)
+
+
+    removeFile(outfile)
+    removeFile(filename)
 
 ############################################################################
 # dag construction
 ############################################################################
+
 
 
 
@@ -258,4 +384,129 @@ task_store_paresed_in_azure = PythonOperator(
     dag=dag,
 )
 
-task_copy_azure_gcp >> task_store_paresed_in_azure
+bigquery_schema = """
+[
+	{
+		"name": "EnqueuedTimeUtc",
+		"type": "STRING",
+		"mode" : "NULLABLE" 
+	},
+	{
+		"name": "SystemProperties",
+		"mode" : "NULLABLE",
+		"type": "RECORD",
+		"fields": [
+			{
+				"name": "messageId",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "correlationId",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "connectionDeviceId",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "connectionAuthMethod",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "connectionDeviceGenerationId",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "contentType",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "enqueuedTime",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			}
+		]
+	},
+	{
+		"name": "Body",
+		"type": "RECORD",
+		"mode" : "NULLABLE",
+		"fields": [
+			{
+				"name": "deviceId",
+		        "mode" : "NULLABLE",
+				"type": "STRING"
+			},
+			{
+				"name": "messageId",
+		        "mode" : "NULLABLE",
+				"type": "INTEGER"
+			},
+			{
+				"name": "temperature",
+		        "mode" : "NULLABLE",
+				"type": "FLOAT"
+			},
+			{
+				"name": "humidity",
+		        "mode" : "NULLABLE",
+				"type": "FLOAT"
+			}
+		]
+	}
+]
+
+"""
+
+
+task_load_into_bigquery = GoogleCloudStorageToBigQueryOperator(
+    task_id="create_big_table_table",
+    bucket=working_bucket,
+    source_objects=['bigtable/{{ ds }}/{{ ds }}.json'],
+    destination_project_dataset_table="camp2019-pani-236011.e2e_testdata.airflow_{{ ds.replace('-','_') }}",
+    schema_fields=json.loads(bigquery_schema),
+    dag=dag,
+    source_format='NEWLINE_DELIMITED_JSON'
+)
+
+
+# task_store_every_paresed_in_azure = PythonOperator(
+#     task_id="store_single_messages_in_azure",
+#     provide_context=True,
+#     depends_on_past=True,
+#     python_callable=store_every_msg_in_azure,
+#     dag=dag,
+# )
+
+task_create_bq_input = PythonOperator(
+    task_id="create_big_query_input",
+    provide_context=True,
+    depends_on_past=True,
+    python_callable=create_big_query_input,
+    dag=dag,
+)
+
+task_flatten_json_files = PythonOperator(
+    task_id="flatten_json_files",
+    provide_context=True,
+    depends_on_past=True,
+    python_callable=flatten_files,
+    dag=dag
+)
+
+#task_insert_into_sql = CloudSqlInstanceImportOperator(
+#    dag=dag,
+#    task_id="import_into_sql",
+#    instance='powerbi-source',
+#    body
+#)
+
+task_copy_azure_gcp >> task_store_paresed_in_azure  #>> task_store_every_paresed_in_azure
+task_copy_azure_gcp >> task_create_bq_input >> task_load_into_bigquery
+task_copy_azure_gcp >> task_flatten_json_files
