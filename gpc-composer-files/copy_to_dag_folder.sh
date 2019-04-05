@@ -1,2 +1,2 @@
 #!/bin/sh
-gsutil cp $1 gs://europe-west1-camp19-compose-15df7b6b-bucket/dags
+gsutil cp $1 gs://europe-west1-yet-yet-anothe-9a6796e2-bucket/dags

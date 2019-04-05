@@ -22,6 +22,7 @@ from azure.storage import *
 
 from airflow.contrib.hooks.wasb_hook import WasbHook
 from azure.storage.blob import BlockBlobService
+import dateutil.parser
 #from airflow.contrib.operators.gcp_sql_operator import CloudSqlInstanceImportOperator
 
 default_args = {
@@ -36,7 +37,7 @@ default_args = {
     'end_date': datetime(2019, 4, 6),
 }
 
-dag = DAG('new-IoT-e2e-pipeline', schedule_interval='@daily', default_args=default_args)
+dag = DAG('new-IoT-e2e-pipeline_hourly', schedule_interval='@hourly', default_args=default_args)
 
 working_bucket = "iot-e2e-bucket"
 
@@ -164,7 +165,10 @@ def input_is_present(ds, **context):
     return True
 
 
-def copy_files_from_azure_to_google(ds, **context):
+def copy_files_from_azure_to_google(ds, ts, **context):
+
+    dt = dateutil.parser.parse(ts)
+
 
     azure_conn_id = "custom_azure_credentials"
     connection = BaseHook.get_connection(azure_conn_id)
@@ -185,7 +189,7 @@ def copy_files_from_azure_to_google(ds, **context):
     blobs = [b for b in generator]
     print(blobs)
     import re
-    file_name_regex = re.compile(r'[A-z0-9]+/[0-9]{2}/%s/%s/%s/[0-2][0-9]/[0-5][0-9]' % tuple(ds_split))
+    file_name_regex = re.compile(r'[A-z0-9]+/[0-9]{2}/%04i/%02i/%02i/%02i/[0-5][0-9]' % (dt.year, dt.month, dt.day, dt.hour))
 
 
     blobs_filtered = [ b for b in blobs if  file_name_regex.match(b.name)]
@@ -235,16 +239,19 @@ def copy_files_from_azure_to_google(ds, **context):
 
         storage_client = storage.Client()
         bucket = storage_client.get_bucket(working_bucket)
-        blob = bucket.blob("raw/%s/%s.json" % (ds, ds) )
+        blob = bucket.blob("raw_hourly/%s/%02i/%s.json" % (ds, dt.hour, ds) )
         blob.upload_from_file(f)
 
 
 
-def stored_paresed_data_in_azure (ds, **context):
+def stored_parsed_data_in_azure (ds, ts, **context):
+    dt = dateutil.parser.parse(ts)
 
     fd, filename = mkstemp(suffix=".json")
-    print("trying to download ")
-    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+    logging.info("start downloading")
+    in_fn = "raw_hourly/%s/%02i/%s.json" % (ds, dt.hour, ds)
+    out_fn = "json_hourly/%s/%02i/%s.json" % (ds, dt.hour, ds)
+    downloadGcSBlob(working_bucket, in_fn, filename, remove_old=True)
 
     azure_conn_id = "custom_azure_credentials"
     connection = BaseHook.get_connection(azure_conn_id)
@@ -252,55 +259,55 @@ def stored_paresed_data_in_azure (ds, **context):
     block_blob_service = BlockBlobService(account_name=connection.login, account_key=connection.password)
     block_blob_service.create_blob_from_path(
         container_name="e2emessgageconverted",
-        blob_name="json/%s/%s.json" %(ds, ds),
+        blob_name=out_fn,
         file_path=filename)
 
     removeFile(filename)
 
-def store_every_msg_in_azure(ds, **context):
 
-    fd, filename = mkstemp(suffix=".json")
-    print("trying to download ")
-    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+def parseMessage(msg):
+    try:
+        m = {}
+        time = msg["EnqueuedTimeUtc"]
+        body = msg["Body"]
+        props = msg["SystemProperties"]
 
-    azure_conn_id = "custom_azure_credentials"
-    connection = BaseHook.get_connection(azure_conn_id)
+        m["EnqueuedTimeUtc"] = time
 
-    import json
-    with open(filename, 'r') as f:
-        content = json.load(f)
-        block_blob_service = BlockBlobService(account_name=connection.login, account_key=connection.password)
-        count = 0
-        for mesg in content:
-            with NamedTemporaryFile(mode='a+b', delete=True) as outfile:
-                try:
-                    outfile.write( json.dumps(mesg).encode())
-                except Exception as e :
-                    logging.error(str(e))
-                    print(type(mesg))
-                    pprint(mesg)
-                    from sys import exit
-                    exit(-1)
+        b = {}
 
-                outfile.seek(0)
-                block_blob_service.create_blob_from_stream(
-                    container_name="e2emessgageconverted",
-                    blob_name="single_files/%s/%i.json" %(ds, count),
-                    stream=outfile)
-                count += 1
+        b["dateTime"] = body["dateTime"]
+        b["ip"] = str(body["ip"])
+        b["vibration"] =float(body["vibration"])
+        b["voltage"] =float(body["voltage"])
+        b["temperature"] =float(body["temperature"])
+        b["messageId"] =str(body["messageId"])
 
-    removeFile(filename)
+        m["EnqueuedTimeUtc"] = time
+        m["Body"] = b
+        m["SystemProperties"] = props
+
+        return m
 
 
+    except Exception as e:
+        #pprint(e)
+        #pprint(msg)
+        return None
 
-def create_big_query_input(ds, **context):
+
+def create_big_query_input(ds, ts,**context):
 
     print("\nstart create_big_query_input")
+
+    dt = dateutil.parser.parse(ts)
     #downloadGcSBlob(working_bucket, name, dest)
 
     fd, filename = mkstemp(suffix=".json")
     logging.info("start downloading")
-    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
+    in_fn = "raw_hourly/%s/%02i/%s.json" % (ds, dt.hour, ds)
+    out_fn = "big_query_hourly/%s/%02i/%s.json" % (ds, dt.hour, ds)
+    downloadGcSBlob(working_bucket, in_fn, filename, remove_old=True)
 
     outputfile, outputfile_name = mkstemp(suffix=".json")
     with open(filename, 'r') as inputfile:
@@ -310,86 +317,23 @@ def create_big_query_input(ds, **context):
             logging.info("start processing messages")
             counter=0
             for msg in content:
-                del msg["Properties"]
-                #outputfile.write(json.dumps(msg["Body"]))
-                if 'messageId' in msg["Body"].keys():
-                    msg["Body"]["messageId"] = str(msg["Body"]["messageId"])
+                parsed_msg = parseMessage(msg)
+                if parsed_msg == None:
+                    continue
 
-                outputfile.write(json.dumps(msg))
+                outputfile.write(json.dumps(parsed_msg))
                 outputfile.write('\n')
                 counter +=1
 
             logging.info("start uploading")
             print('\n number of entries: %i' % counter)
-            uploadGcSBlob(working_bucket, outputfile_name, 'bigtable/%s/%s.json' % (ds, ds))
+            uploadGcSBlob(working_bucket, outputfile_name, out_fn)
 
 
     removeFile(filename)
     removeFile(outputfile_name)
 
 
-
-def flatten_files(ds, **context):
-
-    fd, filename = mkstemp(suffix=".json")
-    logging.info("start downloading")
-    downloadGcSBlob(working_bucket, "raw/%s/%s.json" %(ds, ds), filename, remove_old=True)
-
-    with open(filename, 'r') as f:
-        messages = json.load(f)
-
-    columns = ['EnqueuedTimeUtc', 'SystemProperties.messageId', 'SystemProperties.correlationId', 'SystemProperties.connectionDeviceId', 'SystemProperties.connectionAuthMethod', 'SystemProperties.connectionDeviceGenerationId', 'SystemProperties.contentType', 'SystemProperties.enqueuedTime', 'Body.deviceId', 'Body.messageId', 'Body.temperature', 'Body.humidity']
-
-
-    messages_flat = [ flattenjson(m,'.') for m in messages  ]
-    df = pd.DataFrame(messages_flat)
-
-    fd, outfile = mkstemp(suffix=".csv")
-    df.to_csv(outfile)
-
-
-    uploadGcSBlob(working_bucket, outfile, 'csv/%s/%s.json' % (ds, ds) )
-
-    logging.info("write to mysql")
-    from sqlalchemy import create_engine
-
-    host="XXXXXXXXXXXX"
-    database="powerbi_stuff"
-    user="powerbi"
-    password="XXXXXXXXXXXXXXXX"
-
-    print("\nsize of df=%i" % len(df))
-    engine=create_engine("mysql://%s:%s@%s/%s" % (user, password, host, database) )
-    df.to_sql(ds.replace('-',"_"), engine, if_exists='replace', chunksize=1000)
-
-
-    removeFile(outfile)
-    removeFile(filename)
-
-############################################################################
-# dag construction
-############################################################################
-
-
-
-
-task_copy_azure_gcp = PythonOperator(
-    task_id="copy_files_azure_to_google",
-    provide_context=True,
-    depends_on_past=True,
-    python_callable=copy_files_from_azure_to_google,
-    dag=dag,
-)
-
-
-
-task_store_paresed_in_azure = PythonOperator(
-    task_id="stored_paresed_data_in_azure",
-    provide_context=True,
-    depends_on_past=True,
-    python_callable=stored_paresed_data_in_azure,
-    dag=dag,
-)
 
 bigquery_schema = """
 [
@@ -446,12 +390,12 @@ bigquery_schema = """
 		"mode" : "NULLABLE",
 		"fields": [
 			{
-				"name": "timestamp",
+				"name": "id",
 		        "mode" : "NULLABLE",
 				"type": "STRING"
 			},
 			{
-				"name": "id",
+				"name": "timestamp",
 		        "mode" : "NULLABLE",
 				"type": "STRING"
 			},
@@ -552,49 +496,37 @@ bigquery_schema = """
 
 """
 
+############################################################################
+# dag construction
+############################################################################
 
-task_load_into_bigquery = GoogleCloudStorageToBigQueryOperator(
-    task_id="create_big_table_table",
-    bucket=working_bucket,
-    source_objects=['bigtable/{{ ds }}/{{ ds }}.json'],
-    destination_project_dataset_table="camp2019-pani-236011.e2e_testdata.airflow_{{ ds.replace('-','_') }}",
-    schema_fields=json.loads(bigquery_schema),
+
+
+
+task_copy_azure_gcp = PythonOperator(
+    task_id="copy_files_azure_to_google",
+    provide_context=True,
+    depends_on_past=True,
+    python_callable=copy_files_from_azure_to_google,
     dag=dag,
-    source_format='NEWLINE_DELIMITED_JSON'
 )
-
-
-# task_store_every_paresed_in_azure = PythonOperator(
-#     task_id="store_single_messages_in_azure",
-#     provide_context=True,
-#     depends_on_past=True,
-#     python_callable=store_every_msg_in_azure,
-#     dag=dag,
-# )
 
 task_create_bq_input = PythonOperator(
     task_id="create_big_query_input",
     provide_context=True,
-    depends_on_past=True,
+    depends_on_past=False,
     python_callable=create_big_query_input,
     dag=dag,
 )
 
-task_flatten_json_files = PythonOperator(
-    task_id="flatten_json_files",
+
+task_store_parsed_in_azure = PythonOperator(
+    task_id="stored_parsed_data_in_azure",
     provide_context=True,
     depends_on_past=True,
-    python_callable=flatten_files,
-    dag=dag
+    python_callable=stored_parsed_data_in_azure,
+    dag=dag,
 )
 
-#task_insert_into_sql = CloudSqlInstanceImportOperator(
-#    dag=dag,
-#    task_id="import_into_sql",
-#    instance='powerbi-source',
-#    body
-#)
-
-task_copy_azure_gcp >> task_store_paresed_in_azure  #>> task_store_every_paresed_in_azure
-task_copy_azure_gcp >> task_create_bq_input >> task_load_into_bigquery
-task_copy_azure_gcp >> task_flatten_json_files
+task_copy_azure_gcp >> task_create_bq_input # >> task_load_into_bigquery
+task_copy_azure_gcp >> task_store_parsed_in_azure
